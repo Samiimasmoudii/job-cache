@@ -19,6 +19,7 @@ from pydantic import BaseModel
 
 import db
 import http_util
+from normalize import normalize_posted_at
 import queue_io
 import tracker
 import harvester
@@ -621,12 +622,15 @@ def import_all(body: ImportBody):
     """Import a friend's export: adds their jobs + decision history (star/notes/status)."""
     conn = _conn()
     added = updated = 0
-    requeued = 0
+    requeued = skipped = 0
     try:
         done = queue_io.done_ids()
         pending_ids = {fn[:-5] for fn in os.listdir(queue_io.PENDING_DIR)} \
             if os.path.isdir(queue_io.PENDING_DIR) else set()
         for j in (body.jobs or []):
+            if not isinstance(j, dict) or not queue_io.is_safe_id(j.get("id")):
+                skipped += 1  # no id, or one that isn't safe to use as a file name
+                continue
             existing = db.get_job(conn, j.get("id"))
             cols = ("company", "ats_type", "ats_job_id", "title", "location_raw", "city",
                     "description", "apply_url", "role_family", "is_startup", "sponsorship",
@@ -638,6 +642,7 @@ def import_all(body: ImportBody):
             row["starred"] = 1 if j.get("starred") else 0
             mr = j.get("match_reasons")
             row["match_reasons"] = json.dumps(mr) if isinstance(mr, list) else (mr or "[]")
+            row["posted_at"] = normalize_posted_at(row["posted_at"])
             if existing and not body.merge:
                 continue
             placeholders = ", ".join("?" for _ in row)
@@ -654,12 +659,30 @@ def import_all(body: ImportBody):
             if row["status"] == "queued" and row["id"] not in done and row["id"] not in pending_ids:
                 queue_io.write_pending(row)
                 requeued += 1
-        # decisions history
+        # decisions history — skip events already present (same ts/job/action),
+        # so importing the same export twice doesn't double-count decisions in
+        # the learned model.
+        seen_events = {(r["ts"], r["job_id"], r["action"]) for r in
+                       conn.execute("SELECT ts, job_id, action FROM events")}
+        events_added = 0
         for e in (body.events or []):
+            if not isinstance(e, dict):
+                continue
+            key = (e.get("ts"), e.get("job_id"), e.get("action"))
+            if key in seen_events:
+                continue
+            seen_events.add(key)
+            feats = e.get("features")
+            feats = json.dumps(feats) if isinstance(feats, dict) else (feats or "{}")
             conn.execute("INSERT INTO events (ts, job_id, action, features) VALUES (?,?,?,?)",
-                         (e.get("ts"), e.get("job_id"), e.get("action"), e.get("features") or "{}"))
+                         (*key, feats))
+            events_added += 1
         # Q&A history
+        questions_added = 0
         for q in (body.questions or []):
+            if not isinstance(q, dict) or not queue_io.is_safe_id(q.get("id")):
+                continue
+            questions_added += 1
             conn.execute(
                 "INSERT OR REPLACE INTO questions (id, ts, job_id, company, question, answer, status) "
                 "VALUES (?,?,?,?,?,?,?)",
@@ -682,50 +705,76 @@ def import_all(body: ImportBody):
                 json.dump(cfg, f, ensure_ascii=False, indent=2)
         learn.invalidate()
         return {"ok": True, "added": added, "updated": updated, "materials": mats,
-                "requeued": requeued,
-                "questions": len(body.questions or []), "events": len(body.events or [])}
+                "requeued": requeued, "skipped": skipped,
+                "questions": questions_added, "events": events_added}
     finally:
         conn.close()
 
 
 # --- apply workspace: iframe proxy -----------------------------------------
-# ATS platforms whose client app routes entirely off window.location (React-
-# style SPA routers). Serving their HTML through srcdoc/a proxy URL gives the
-# iframe a location that doesn't match their real path, so their own router
-# can't find the posting and renders ITS OWN "page not found" — which reads as
-# a dead job to the user even though the real page is fine. No text-rewriting
-# trick fixes this without a real reverse proxy, so skip the fetch entirely and
-# go straight to the blocked-embed fallback instead of showing that misleading
-# page inside our iframe.
-_NON_EMBEDDABLE_HOSTS = ("ashbyhq.com", "myworkdayjobs.com")
+# Whether a real <iframe src="..."> can show an apply page depends on whether
+# the site actually blocks framing, not on which ATS it happens to be. A
+# real iframe (mode "direct") keeps the page's true origin, so its own JS
+# runs normally: client routing, same-origin fetches to its own API, cookies.
+# Serving the page's HTML back through OUR origin (mode "proxy", via srcdoc)
+# is the only way to beat an actual X-Frame-Options/CSP block, but it breaks
+# any client app whose JS depends on the real origin (its own API calls become
+# cross-origin and get rejected) — so it's a fallback for blocked sites only,
+# never the default. Verified against live ATS pages: Lever/Workable/Ashby
+# send no *enforcing* frame block (Ashby's X-Frame-Options: DENY is overridden
+# by its own CSP frame-ancestors *) and render correctly as "direct"; Workday
+# and SmartRecruiters do block framing and need "proxy".
+_FRAME_ANCESTORS_RE = re.compile(r"(?:^|;)\s*frame-ancestors\b([^;]*)", re.I)
 
 
-def _is_known_non_embeddable(url: str) -> bool:
-    host = urlparse(url).netloc.lower()
-    return any(host == h or host.endswith("." + h) for h in _NON_EMBEDDABLE_HOSTS)
+def _frame_blocked(headers) -> bool:
+    """True if a real <iframe src> to this response would be refused by the browser.
+
+    Per the Fetch/CSP spec, an enforcing Content-Security-Policy's
+    frame-ancestors directive (not Content-Security-Policy-Report-Only, which
+    only logs) takes precedence over X-Frame-Options when both are present;
+    X-Frame-Options is only consulted as a fallback.
+
+    Only a bare `*` source allows us (the dashboard's own origin is
+    localhost); a host wildcard like `https://*.ashbyhq.com` still blocks.
+    A response can carry several enforcing policies (repeated headers, or
+    comma-joined in one) and the browser applies every one of them, so any
+    policy whose frame-ancestors lacks `*` blocks the frame.
+    """
+    get_all = getattr(headers, "get_all", None)
+    csp_headers = (get_all("Content-Security-Policy") if get_all
+                   else [headers.get("Content-Security-Policy")]) or []
+    source_lists = []
+    for header in csp_headers:
+        for policy in (header or "").split(","):
+            m = _FRAME_ANCESTORS_RE.search(policy)
+            if m:
+                source_lists.append(m.group(1).split())
+    if source_lists:
+        return not all("*" in sources for sources in source_lists)
+    xfo = (headers.get("X-Frame-Options") or "").lower()
+    return "deny" in xfo or "sameorigin" in xfo
 
 
 @app.get("/api/proxy")
 def proxy(url: str):
-    """Best-effort fetch of an apply page with frame-blocking headers stripped, so it
-    can render inside the Apply Workspace iframe for side-by-side copy-paste.
+    """Fetch an apply page and decide how the Apply Workspace should show it.
 
-    Classic server-rendered ATS pages (Greenhouse, Lever) usually work; known
-    SPA-only platforms (see _NON_EMBEDDABLE_HOSTS) are rejected up front.
+    Returns JSON `{"ok": true, "mode": "direct"}` when the site doesn't block
+    framing, so the frontend can point a real iframe at it (preserving its
+    origin, so its own JS works normally). Returns `{"ok": true, "mode":
+    "proxy", "html": "..."}` when the site does block framing: the fetched
+    HTML has frame-blocking headers stripped by construction (we return JSON,
+    not the raw response) and a `<base>` tag injected, for the frontend to
+    load via srcdoc. This is a best-effort fallback and can still misrender
+    for client apps that don't survive an origin change.
 
-    On failure (dead link, refuses to answer, times out, isn't HTML, or is a
-    known-non-embeddable host) this returns a JSON error with a non-2xx status
-    instead of a 200 HTML page, so the frontend can tell success from failure
-    and show its own blocked-embed card rather than a misleading page (either
-    an error snippet, or the ATS's own client-side "not found") rendered
-    inside the iframe.
+    On failure (dead link, refuses to answer, times out, or isn't HTML) this
+    returns a JSON error with a non-2xx status so the frontend can show its
+    own blocked-embed card instead of a misleading page.
     """
     if not (url.startswith("http://") or url.startswith("https://")):
         raise HTTPException(400, "bad url")
-    if _is_known_non_embeddable(url):
-        return JSONResponse(
-            {"ok": False, "status": None, "reason": "This site's application form doesn't survive embedding"},
-            status_code=502)
     req = urllib.request.Request(url, headers={
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
                       "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
@@ -734,6 +783,7 @@ def proxy(url: str):
     try:
         with urllib.request.urlopen(req, timeout=12) as r:
             ctype = r.headers.get("Content-Type", "text/html")
+            blocked = _frame_blocked(r.headers)
             raw = r.read()
     except urllib.error.HTTPError as e:
         return JSONResponse({"ok": False, "status": e.code, "reason": str(e.reason)}, status_code=502)
@@ -742,6 +792,8 @@ def proxy(url: str):
         return JSONResponse({"ok": False, "status": None, "reason": reason}, status_code=502)
     if "html" not in ctype:
         return JSONResponse({"ok": False, "status": 200, "reason": "Not an HTML page"}, status_code=502)
+    if not blocked:
+        return JSONResponse({"ok": True, "mode": "direct"})
     try:
         text = raw.decode("utf-8", errors="replace")
     except Exception:  # noqa
@@ -755,8 +807,7 @@ def proxy(url: str):
         text = text[:end] + base_tag + text[end:]
     else:
         text = base_tag + text
-    # response omits X-Frame-Options / CSP, so it is embeddable
-    return HTMLResponse(text)
+    return JSONResponse({"ok": True, "mode": "proxy", "html": text})
 
 
 def _inlined_index() -> str:

@@ -1,8 +1,9 @@
-"""Shared normalization helpers: HTML stripping, city + role-family classification."""
+"""Shared normalization helpers: HTML stripping, dates, city + role-family classification."""
 from __future__ import annotations
 
 import html
 import re
+from datetime import datetime, timezone
 from typing import Optional
 from urllib.parse import urlparse
 
@@ -123,6 +124,46 @@ ROLE_FAMILIES = [
              "frontend", "front-end", "front end", "full stack", "full-stack", "fullstack",
              "developer", "sde", "platform engineer", "web engineer", "python engineer"]),
 ]
+
+
+def parse_date(value) -> Optional[datetime]:
+    """Parse any posted_at shape the adapters hand us into an aware UTC datetime:
+    epoch seconds or millis (Arbeitnow, Himalayas, Lever), ISO 8601 with or
+    without an offset / trailing Z, or a bare YYYY-MM-DD. None if unparseable."""
+    if value is None:
+        return None
+    v = str(value).strip()
+    if not v:
+        return None
+    if v.isdigit():
+        num = int(v)
+        if num > 10_000_000_000:  # millis
+            num //= 1000
+        try:
+            return datetime.fromtimestamp(num, tz=timezone.utc)
+        except (ValueError, OSError, OverflowError):
+            return None
+    try:
+        dt = datetime.fromisoformat(v.replace("Z", "+00:00"))
+    except ValueError:
+        try:
+            dt = datetime.strptime(v[:10], "%Y-%m-%d")
+        except ValueError:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+ISO_UTC_FORMAT = "%Y-%m-%dT%H:%M:%S+00:00"
+
+
+def normalize_posted_at(value) -> Optional[str]:
+    """One canonical posted_at string ("2026-09-30T12:06:20+00:00", always UTC)
+    so it sorts correctly as text in SQL and parses with JS `new Date()`.
+    Unparseable values become None (shown as "Unknown date")."""
+    dt = parse_date(value)
+    return dt.strftime(ISO_UTC_FORMAT) if dt else None
 
 
 def slugify(name: str) -> str:

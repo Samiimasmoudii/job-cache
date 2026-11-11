@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from typing import Optional, Set
 
 from normalize import slugify
@@ -24,6 +25,15 @@ PREFS_EXAMPLE_PATH = os.path.join(ROOT, "preferences.example.md")
 ONBOARDING_PATH = os.path.join(ROOT, "data", "onboarding.json")
 
 RESERVED = {"cover-letter", "cv"}  # non-job files inside a company folder
+
+# Job and question ids become file names (queue/pending/<id>.json, ...). Ours
+# are hex hashes; anything else (e.g. "../x" in an imported export) must never
+# reach a path.
+_SAFE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def is_safe_id(value) -> bool:
+    return isinstance(value, str) and bool(_SAFE_ID_RE.match(value))
 
 INSTRUCTIONS = (
     "Group all pending jobs BY COMPANY. For each company write ONE applications/<slug>/"
@@ -106,6 +116,8 @@ def write_pending(job: dict) -> str:
         "preferences_markdown": read_preferences(),
         "instructions": INSTRUCTIONS,
     }
+    if not is_safe_id(job.get("id")):
+        raise ValueError(f"unsafe job id: {job.get('id')!r}")
     path = os.path.join(PENDING_DIR, f"{job['id']}.json")
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
@@ -231,6 +243,8 @@ def answered_question_ids() -> Set[str]:
 
 
 def clear_question_files(qid: str) -> None:
+    if not is_safe_id(qid):
+        return
     for path in (os.path.join(Q_PENDING_DIR, f"{qid}.json"),
                  os.path.join(Q_ANSWERED_DIR, f"{qid}.md")):
         try:

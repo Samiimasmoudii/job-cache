@@ -11,7 +11,12 @@ from http_util import get_json
 from models import Job
 from normalize import strip_html
 
-LIST = "https://api.smartrecruiters.com/v1/companies/{slug}/postings?limit=100"
+LIST = "https://api.smartrecruiters.com/v1/companies/{slug}/postings?limit={limit}&offset={offset}"
+# The list endpoint pages at most 100 postings. Walk every page: this is a
+# single-company board, so the harvester closes any posting missing from what
+# we return — stopping at page 1 would close everything past the first 100.
+PAGE_SIZE = 100
+MAX_PAGES = 20  # safety cap (2,000 postings)
 DETAIL = "https://api.smartrecruiters.com/v1/companies/{slug}/postings/{id}"
 APPLY = "https://jobs.smartrecruiters.com/{slug}/{id}"
 
@@ -59,5 +64,13 @@ def parse(company: dict, payload: dict, with_detail: bool = True) -> List[Job]:
 
 
 def fetch(company: dict) -> List[Job]:
-    url = LIST.format(slug=company["ats_slug"])
-    return parse(company, get_json(url))
+    slug = company["ats_slug"]
+    content: list = []
+    for _ in range(MAX_PAGES):
+        payload = get_json(LIST.format(slug=slug, limit=PAGE_SIZE, offset=len(content)))
+        batch = payload.get("content") or []
+        content.extend(batch)
+        total = int(payload.get("totalFound") or 0)
+        if not batch or len(content) >= total:
+            break
+    return parse(company, {"content": content})
