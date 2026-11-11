@@ -1,0 +1,17 @@
+# Store text as LF in the repo on every OS (see AGENTS.md, "Line endings").
+* text=auto eol=lf
+
+# cmd.exe needs CRLF batch files.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Binary: never touch.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.db binary
+*.woff binary
+*.woff2 binary
