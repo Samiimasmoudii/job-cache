@@ -10,7 +10,7 @@ import yaml
 from adapters import AGGREGATORS, fetch_company
 from flagger import classify_sponsorship
 from models import Job
-from normalize import classify_city, classify_role_family
+from normalize import classify_city, classify_role_family, normalize_posted_at
 from ranker import score_job
 from seniority import classify_seniority, extract_required_years
 import db
@@ -33,6 +33,7 @@ def _is_aggregator(company: dict) -> bool:
 
 
 def enrich(job: Job, extra_keywords: Optional[List[str]] = None) -> Job:
+    job.posted_at = normalize_posted_at(job.posted_at)
     job.city = classify_city(job.location_raw)
     job.role_family = classify_role_family(job.title, job.description)
     job.sponsorship = classify_sponsorship(job.description)

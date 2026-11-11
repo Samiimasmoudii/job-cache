@@ -11,6 +11,11 @@ from http_util import post_json
 from models import Job
 
 ENDPOINT = "https://{host}/wday/cxs/{tenant}/{board}/jobs"
+# Workday's CxS API caps a page at 20 postings. Walk every page: this is a
+# single-company board, so the harvester closes any posting missing from what
+# we return — stopping at page 1 would close everything past the first 20.
+PAGE_SIZE = 20
+MAX_PAGES = 100  # safety cap (2,000 postings)
 
 
 def _parse_slug(ats_slug: str):
@@ -43,5 +48,16 @@ def parse(company: dict, host: str, payload: dict) -> List[Job]:
 def fetch(company: dict) -> List[Job]:
     host, tenant, board = _parse_slug(company["ats_slug"])
     url = ENDPOINT.format(host=host, tenant=tenant, board=board)
-    payload = post_json(url, {"limit": 20, "offset": 0, "searchText": "", "appliedFacets": {}})
-    return parse(company, host, payload)
+    postings: list = []
+    total = None
+    for _ in range(MAX_PAGES):
+        payload = post_json(url, {"limit": PAGE_SIZE, "offset": len(postings),
+                                  "searchText": "", "appliedFacets": {}})
+        batch = payload.get("jobPostings") or []
+        # Workday only reports the real total on the first page (later pages say 0).
+        if total is None:
+            total = int(payload.get("total") or 0)
+        postings.extend(batch)
+        if not batch or len(postings) >= total:
+            break
+    return parse(company, host, {"jobPostings": postings})

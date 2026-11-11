@@ -19,6 +19,7 @@ from pydantic import BaseModel
 
 import db
 import http_util
+from normalize import normalize_posted_at
 import queue_io
 import tracker
 import harvester
@@ -621,12 +622,15 @@ def import_all(body: ImportBody):
     """Import a friend's export: adds their jobs + decision history (star/notes/status)."""
     conn = _conn()
     added = updated = 0
-    requeued = 0
+    requeued = skipped = 0
     try:
         done = queue_io.done_ids()
         pending_ids = {fn[:-5] for fn in os.listdir(queue_io.PENDING_DIR)} \
             if os.path.isdir(queue_io.PENDING_DIR) else set()
         for j in (body.jobs or []):
+            if not isinstance(j, dict) or not queue_io.is_safe_id(j.get("id")):
+                skipped += 1  # no id, or one that isn't safe to use as a file name
+                continue
             existing = db.get_job(conn, j.get("id"))
             cols = ("company", "ats_type", "ats_job_id", "title", "location_raw", "city",
                     "description", "apply_url", "role_family", "is_startup", "sponsorship",
@@ -638,6 +642,7 @@ def import_all(body: ImportBody):
             row["starred"] = 1 if j.get("starred") else 0
             mr = j.get("match_reasons")
             row["match_reasons"] = json.dumps(mr) if isinstance(mr, list) else (mr or "[]")
+            row["posted_at"] = normalize_posted_at(row["posted_at"])
             if existing and not body.merge:
                 continue
             placeholders = ", ".join("?" for _ in row)
@@ -654,12 +659,30 @@ def import_all(body: ImportBody):
             if row["status"] == "queued" and row["id"] not in done and row["id"] not in pending_ids:
                 queue_io.write_pending(row)
                 requeued += 1
-        # decisions history
+        # decisions history — skip events already present (same ts/job/action),
+        # so importing the same export twice doesn't double-count decisions in
+        # the learned model.
+        seen_events = {(r["ts"], r["job_id"], r["action"]) for r in
+                       conn.execute("SELECT ts, job_id, action FROM events")}
+        events_added = 0
         for e in (body.events or []):
+            if not isinstance(e, dict):
+                continue
+            key = (e.get("ts"), e.get("job_id"), e.get("action"))
+            if key in seen_events:
+                continue
+            seen_events.add(key)
+            feats = e.get("features")
+            feats = json.dumps(feats) if isinstance(feats, dict) else (feats or "{}")
             conn.execute("INSERT INTO events (ts, job_id, action, features) VALUES (?,?,?,?)",
-                         (e.get("ts"), e.get("job_id"), e.get("action"), e.get("features") or "{}"))
+                         (*key, feats))
+            events_added += 1
         # Q&A history
+        questions_added = 0
         for q in (body.questions or []):
+            if not isinstance(q, dict) or not queue_io.is_safe_id(q.get("id")):
+                continue
+            questions_added += 1
             conn.execute(
                 "INSERT OR REPLACE INTO questions (id, ts, job_id, company, question, answer, status) "
                 "VALUES (?,?,?,?,?,?,?)",
@@ -682,8 +705,8 @@ def import_all(body: ImportBody):
                 json.dump(cfg, f, ensure_ascii=False, indent=2)
         learn.invalidate()
         return {"ok": True, "added": added, "updated": updated, "materials": mats,
-                "requeued": requeued,
-                "questions": len(body.questions or []), "events": len(body.events or [])}
+                "requeued": requeued, "skipped": skipped,
+                "questions": questions_added, "events": events_added}
     finally:
         conn.close()
 
@@ -701,6 +724,9 @@ def import_all(body: ImportBody):
 # send no *enforcing* frame block (Ashby's X-Frame-Options: DENY is overridden
 # by its own CSP frame-ancestors *) and render correctly as "direct"; Workday
 # and SmartRecruiters do block framing and need "proxy".
+_FRAME_ANCESTORS_RE = re.compile(r"(?:^|;)\s*frame-ancestors\b([^;]*)", re.I)
+
+
 def _frame_blocked(headers) -> bool:
     """True if a real <iframe src> to this response would be refused by the browser.
 
@@ -708,11 +734,24 @@ def _frame_blocked(headers) -> bool:
     frame-ancestors directive (not Content-Security-Policy-Report-Only, which
     only logs) takes precedence over X-Frame-Options when both are present;
     X-Frame-Options is only consulted as a fallback.
+
+    Only a bare `*` source allows us (the dashboard's own origin is
+    localhost); a host wildcard like `https://*.ashbyhq.com` still blocks.
+    A response can carry several enforcing policies (repeated headers, or
+    comma-joined in one) and the browser applies every one of them, so any
+    policy whose frame-ancestors lacks `*` blocks the frame.
     """
-    csp = headers.get("Content-Security-Policy", "")
-    m = re.search(r"frame-ancestors\s+([^;]+)", csp, re.I)
-    if m:
-        return "*" not in m.group(1)
+    get_all = getattr(headers, "get_all", None)
+    csp_headers = (get_all("Content-Security-Policy") if get_all
+                   else [headers.get("Content-Security-Policy")]) or []
+    source_lists = []
+    for header in csp_headers:
+        for policy in (header or "").split(","):
+            m = _FRAME_ANCESTORS_RE.search(policy)
+            if m:
+                source_lists.append(m.group(1).split())
+    if source_lists:
+        return not all("*" in sources for sources in source_lists)
     xfo = (headers.get("X-Frame-Options") or "").lower()
     return "deny" in xfo or "sameorigin" in xfo
 

@@ -88,7 +88,26 @@ def _migrate(conn: sqlite3.Connection) -> None:
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(_SCHEMA)
     _migrate(conn)
+    normalize_posted_dates(conn)
     conn.commit()
+
+
+# A posted_at already in normalize.ISO_UTC_FORMAT. Anything else (epoch
+# seconds/millis, other offsets, bare dates) predates normalization at harvest
+# time and sorts wrong as text, so it gets rewritten once.
+_CANONICAL_DATE_GLOB = "[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]+00:00"
+
+
+def normalize_posted_dates(conn: sqlite3.Connection) -> int:
+    """Rewrite non-canonical posted_at values in place. Cheap no-op once done."""
+    from normalize import normalize_posted_at
+    rows = conn.execute(
+        "SELECT id, posted_at FROM jobs WHERE posted_at IS NOT NULL AND posted_at NOT GLOB ?",
+        (_CANONICAL_DATE_GLOB,)).fetchall()
+    if rows:
+        conn.executemany("UPDATE jobs SET posted_at=? WHERE id=?",
+                         [(normalize_posted_at(r["posted_at"]), r["id"]) for r in rows])
+    return len(rows)
 
 
 def backfill_seniority(conn: sqlite3.Connection) -> int:

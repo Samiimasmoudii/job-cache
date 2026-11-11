@@ -5,10 +5,11 @@ Claude Code does the *deep* tailoring later; this only gives the dashboard a goo
 """
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 from typing import List, Optional, Tuple
 
-from normalize import classify_role_family, title_matches_family
+from normalize import classify_role_family, parse_date, title_matches_family
 
 # Skills drawn from the CV (see cv/cv.md). Multi-word phrases matched as substrings.
 CV_SKILLS = [
@@ -26,37 +27,24 @@ _SKILLS_SATURATION = 8
 _RECENCY_WINDOW_DAYS = 60.0
 
 
-def _parse_date(value: Optional[str]) -> Optional[datetime]:
-    if not value:
-        return None
-    v = value.strip()
-    # Epoch millis or seconds.
-    if v.isdigit():
-        num = int(v)
-        if num > 10_000_000_000:  # millis
-            num //= 1000
-        try:
-            return datetime.fromtimestamp(num, tz=timezone.utc)
-        except (ValueError, OSError):
-            return None
-    v = v.replace("Z", "+00:00")
-    for parser in (datetime.fromisoformat,):
-        try:
-            dt = parser(v)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            return dt
-        except ValueError:
-            pass
-    # Fallback: leading YYYY-MM-DD.
-    try:
-        return datetime.strptime(v[:10], "%Y-%m-%d").replace(tzinfo=timezone.utc)
-    except ValueError:
-        return None
+_PATTERN_CACHE: dict = {}
+
+
+def _skill_pattern(skill: str) -> "re.Pattern":
+    """Whole-word match for a skill, so "java" doesn't hit "javascript", "rag"
+    doesn't hit "storage", and "api" doesn't hit "rapid". Boundaries are
+    "not a letter/digit" rather than \\b, so skills with symbols ("c++",
+    "node.js", "ci/cd") still match. A plural "s" is allowed ("pipelines", "apis"); a trailing
+    "+" or "#" counts as part of the word, so "c" doesn't hit "c++" or "c#"."""
+    pat = _PATTERN_CACHE.get(skill)
+    if pat is None:
+        pat = re.compile(r"(?<![a-z0-9])" + re.escape(skill) + r"s?(?![a-z0-9+#])")
+        _PATTERN_CACHE[skill] = pat
+    return pat
 
 
 def _recency(posted_at: Optional[str], now: Optional[datetime] = None) -> float:
-    dt = _parse_date(posted_at)
+    dt = parse_date(posted_at)
     if dt is None:
         return 0.5  # unknown date → neutral
     now = now or datetime.now(timezone.utc)
@@ -73,7 +61,7 @@ def _skills_overlap(text: str, extra_skills: Optional[List[str]] = None) -> Tupl
         s = (s or "").strip().lower()
         if s and s not in vocab:
             vocab.append(s)
-    matched = [s for s in vocab if s in hay]
+    matched = [s for s in vocab if _skill_pattern(s).search(hay)]
     score = min(1.0, len(matched) / _SKILLS_SATURATION)
     return score, matched
 

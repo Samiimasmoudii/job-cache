@@ -35,6 +35,28 @@ class TestFrameBlocked(unittest.TestCase):
             "Content-Security-Policy": "frame-ancestors 'self';",
         })))
 
+    def test_csp_host_wildcard_is_still_blocked(self):
+        # A wildcard *host* doesn't include our localhost origin.
+        self.assertTrue(app_module._frame_blocked(_headers(**{
+            "Content-Security-Policy": "frame-ancestors https://*.ashbyhq.com",
+        })))
+
+    def test_every_enforcing_policy_must_allow(self):
+        m = _headers()
+        m["Content-Security-Policy"] = "frame-ancestors *"
+        m["Content-Security-Policy"] = "frame-ancestors 'self'"
+        self.assertTrue(app_module._frame_blocked(m))
+        self.assertTrue(app_module._frame_blocked(_headers(**{
+            "Content-Security-Policy": "frame-ancestors *, frame-ancestors 'none'",
+        })))
+
+    def test_frame_ancestors_must_be_a_directive_name(self):
+        # "frame-ancestors" inside another directive's value isn't the directive.
+        self.assertTrue(app_module._frame_blocked(_headers(**{
+            "Content-Security-Policy": "report-uri /frame-ancestors *",
+            "X-Frame-Options": "DENY",
+        })))
+
     def test_report_only_csp_is_ignored(self):
         # Workday: only a Report-Only CSP (no frame-ancestors enforced) + XFO DENY -> blocked via XFO.
         self.assertTrue(app_module._frame_blocked(_headers(**{
