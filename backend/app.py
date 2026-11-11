@@ -689,43 +689,53 @@ def import_all(body: ImportBody):
 
 
 # --- apply workspace: iframe proxy -----------------------------------------
-# ATS platforms whose client app routes entirely off window.location (React-
-# style SPA routers). Serving their HTML through srcdoc/a proxy URL gives the
-# iframe a location that doesn't match their real path, so their own router
-# can't find the posting and renders ITS OWN "page not found" — which reads as
-# a dead job to the user even though the real page is fine. No text-rewriting
-# trick fixes this without a real reverse proxy, so skip the fetch entirely and
-# go straight to the blocked-embed fallback instead of showing that misleading
-# page inside our iframe.
-_NON_EMBEDDABLE_HOSTS = ("ashbyhq.com", "myworkdayjobs.com")
+# Whether a real <iframe src="..."> can show an apply page depends on whether
+# the site actually blocks framing, not on which ATS it happens to be. A
+# real iframe (mode "direct") keeps the page's true origin, so its own JS
+# runs normally: client routing, same-origin fetches to its own API, cookies.
+# Serving the page's HTML back through OUR origin (mode "proxy", via srcdoc)
+# is the only way to beat an actual X-Frame-Options/CSP block, but it breaks
+# any client app whose JS depends on the real origin (its own API calls become
+# cross-origin and get rejected) — so it's a fallback for blocked sites only,
+# never the default. Verified against live ATS pages: Lever/Workable/Ashby
+# send no *enforcing* frame block (Ashby's X-Frame-Options: DENY is overridden
+# by its own CSP frame-ancestors *) and render correctly as "direct"; Workday
+# and SmartRecruiters do block framing and need "proxy".
+def _frame_blocked(headers) -> bool:
+    """True if a real <iframe src> to this response would be refused by the browser.
 
-
-def _is_known_non_embeddable(url: str) -> bool:
-    host = urlparse(url).netloc.lower()
-    return any(host == h or host.endswith("." + h) for h in _NON_EMBEDDABLE_HOSTS)
+    Per the Fetch/CSP spec, an enforcing Content-Security-Policy's
+    frame-ancestors directive (not Content-Security-Policy-Report-Only, which
+    only logs) takes precedence over X-Frame-Options when both are present;
+    X-Frame-Options is only consulted as a fallback.
+    """
+    csp = headers.get("Content-Security-Policy", "")
+    m = re.search(r"frame-ancestors\s+([^;]+)", csp, re.I)
+    if m:
+        return "*" not in m.group(1)
+    xfo = (headers.get("X-Frame-Options") or "").lower()
+    return "deny" in xfo or "sameorigin" in xfo
 
 
 @app.get("/api/proxy")
 def proxy(url: str):
-    """Best-effort fetch of an apply page with frame-blocking headers stripped, so it
-    can render inside the Apply Workspace iframe for side-by-side copy-paste.
+    """Fetch an apply page and decide how the Apply Workspace should show it.
 
-    Classic server-rendered ATS pages (Greenhouse, Lever) usually work; known
-    SPA-only platforms (see _NON_EMBEDDABLE_HOSTS) are rejected up front.
+    Returns JSON `{"ok": true, "mode": "direct"}` when the site doesn't block
+    framing, so the frontend can point a real iframe at it (preserving its
+    origin, so its own JS works normally). Returns `{"ok": true, "mode":
+    "proxy", "html": "..."}` when the site does block framing: the fetched
+    HTML has frame-blocking headers stripped by construction (we return JSON,
+    not the raw response) and a `<base>` tag injected, for the frontend to
+    load via srcdoc. This is a best-effort fallback and can still misrender
+    for client apps that don't survive an origin change.
 
-    On failure (dead link, refuses to answer, times out, isn't HTML, or is a
-    known-non-embeddable host) this returns a JSON error with a non-2xx status
-    instead of a 200 HTML page, so the frontend can tell success from failure
-    and show its own blocked-embed card rather than a misleading page (either
-    an error snippet, or the ATS's own client-side "not found") rendered
-    inside the iframe.
+    On failure (dead link, refuses to answer, times out, or isn't HTML) this
+    returns a JSON error with a non-2xx status so the frontend can show its
+    own blocked-embed card instead of a misleading page.
     """
     if not (url.startswith("http://") or url.startswith("https://")):
         raise HTTPException(400, "bad url")
-    if _is_known_non_embeddable(url):
-        return JSONResponse(
-            {"ok": False, "status": None, "reason": "This site's application form doesn't survive embedding"},
-            status_code=502)
     req = urllib.request.Request(url, headers={
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
                       "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
@@ -734,6 +744,7 @@ def proxy(url: str):
     try:
         with urllib.request.urlopen(req, timeout=12) as r:
             ctype = r.headers.get("Content-Type", "text/html")
+            blocked = _frame_blocked(r.headers)
             raw = r.read()
     except urllib.error.HTTPError as e:
         return JSONResponse({"ok": False, "status": e.code, "reason": str(e.reason)}, status_code=502)
@@ -742,6 +753,8 @@ def proxy(url: str):
         return JSONResponse({"ok": False, "status": None, "reason": reason}, status_code=502)
     if "html" not in ctype:
         return JSONResponse({"ok": False, "status": 200, "reason": "Not an HTML page"}, status_code=502)
+    if not blocked:
+        return JSONResponse({"ok": True, "mode": "direct"})
     try:
         text = raw.decode("utf-8", errors="replace")
     except Exception:  # noqa
@@ -755,8 +768,7 @@ def proxy(url: str):
         text = text[:end] + base_tag + text[end:]
     else:
         text = base_tag + text
-    # response omits X-Frame-Options / CSP, so it is embeddable
-    return HTMLResponse(text)
+    return JSONResponse({"ok": True, "mode": "proxy", "html": text})
 
 
 def _inlined_index() -> str:

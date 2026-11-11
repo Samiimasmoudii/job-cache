@@ -1419,7 +1419,6 @@ function renderAbout() {
 /* ═══════════════════════════════════════════════════════════════════════════
    Apply workspace (iframe + copyable materials)
    ═══════════════════════════════════════════════════════════════════════════ */
-let wsUseProxy = true;
 let wsQaOpenFlag = false;
 let wsOpenForId = null;   // id of the job currently docked in the workspace, or null
 async function openWorkspace(id) {
@@ -1447,12 +1446,11 @@ async function openWorkspace(id) {
       <div class="ws-right">
         <div class="ws-toolbar">
           <span class="url">${esc(j.apply_url)}</span>
-          <div class="seg"><button id="wsProxy" class="${wsUseProxy ? "on" : ""}">Embedded</button><button id="wsDirect" class="${!wsUseProxy ? "on" : ""}">Direct</button></div>
           <button class="btn btn-ghost btn-sm" id="wsReload" title="Reload">${ico("refresh", "btn-ico")}</button>
           <button class="btn btn-primary btn-sm" id="wsPop">${ico("popout", "btn-ico")}<span>Pop out</span></button>
           <button class="btn btn-ghost btn-sm" id="wsQaToggle" title="Application Q&amp;A">${ico("chat", "btn-ico")}<span>Q&amp;A</span></button>
         </div>
-        <div class="ws-hint">${ico("info")}<span>Loaded but the form looks blank? Some SPAs (Ashby, Workday…) render client-side and still don't survive embedding — hit <b>Pop out</b> above to open it in a window beside the app instead.</span></div>
+        <div class="ws-hint">${ico("info")}<span>Loaded but the form looks blank? A handful of sites block framing hard enough that nothing renders right — hit <b>Pop out</b> above to open it in a window beside the app instead.</span></div>
         <div class="ws-stage" id="wsStage"></div>
       </div>
       <div class="ws-qa ${wsQaOpenFlag ? "open" : ""}" id="wsQa">
@@ -1472,8 +1470,6 @@ async function openWorkspace(id) {
   $("#wsClose").onclick = closeWorkspace;
   $("#wsReload").onclick = () => loadWsStage(id, j.apply_url);
   $("#wsPop").onclick = () => openDirectPopout(j.apply_url);
-  $("#wsProxy").onclick = () => { wsUseProxy = true; openWorkspace(id); };
-  $("#wsDirect").onclick = () => { wsUseProxy = false; openWorkspace(id); };
   $("#wsQaToggle").onclick = () => { wsQaOpenFlag = !wsQaOpenFlag; toggleWsQa(); };
   $("#wsQaClose").onclick = () => { wsQaOpenFlag = false; toggleWsQa(); };
   const wa = $("#wsApply"); if (wa) wa.onclick = () => markApplied(id);  // closes workspace + goes to Queue
@@ -1493,17 +1489,34 @@ function wsBlockedHtml(url) {
     <p>This one refuses to load inside the workspace (dead link, blocked, or just not answering). The job itself is one click away though.</p>
     <button class="btn btn-primary" id="wsOpenDirect">${ico("popout", "btn-ico")}<span>Open job page</span></button></div>`;
 }
-// (Re)loads the right-hand stage for the current mode. Embedded mode fetches
-// through our own backend first so a dead link or a hard embedding block
-// (site replies with an error instead of a page) shows the blocked-card
-// fallback instead of an error rendered inside the iframe.
+// Some client-rendered ATS pages (Ashby, notably) block framing outright, so
+// the only way in is fetching the HTML ourselves and loading it via srcdoc —
+// which changes its origin. Their own JS then can't fetch its own job data
+// (now cross-origin) and quietly renders ITS OWN "page not found", which lies
+// to the user: the job is fine, only the embed broke. Caught by
+// wsLooksMisrendered below and swapped for this instead.
+function wsMisrenderedHtml(url) {
+  return `<div class="empty">${ico("lock")}<h3>That "not found" is a lie</h3>
+    <p>This site's application form only works once it thinks it owns the address bar. Embedding it broke that, and it's showing you a fake dead end, not a real one. Pop it out and it'll load fine.</p>
+    <button class="btn btn-primary" id="wsOpenDirect">${ico("popout", "btn-ico")}<span>Open job page</span></button></div>`;
+}
+function wsLooksMisrendered(text) {
+  const t = (text || "").trim();
+  return t.length < 40 || /\b(page not found|not found|application error|something went wrong)\b/i.test(t);
+}
+// (Re)loads the right-hand stage. Always asks our backend first whether this
+// site blocks framing (checks its real X-Frame-Options/CSP headers): sites
+// that don't block get a real iframe src (mode "direct") so their own JS runs
+// with its real origin and works normally; sites that do block get the
+// fetched HTML with those headers stripped, via srcdoc (mode "proxy") — a
+// fallback that can still misrender for client apps that don't survive an
+// origin change, but it's the only way to beat an actual framing block. A
+// dead link or a hard embedding failure (site refuses to answer, isn't HTML)
+// shows the blocked-card fallback instead of an error rendered inside the
+// iframe.
 async function loadWsStage(id, url) {
   const stage = $("#wsStage");
   if (!stage) return;
-  if (!wsUseProxy) {
-    stage.innerHTML = `<iframe class="ws-frame" id="wsFrame" src="${esc(url)}" sandbox="allow-forms allow-scripts allow-same-origin allow-popups"></iframe>`;
-    return;
-  }
   stage.innerHTML = `<div class="empty">${ico("refresh", "ico spin")}<h3>Loading the application page…</h3></div>`;
   let res;
   try { res = await fetch("/api/proxy?url=" + encodeURIComponent(url)); } catch (e) { res = null; }
@@ -1513,10 +1526,26 @@ async function loadWsStage(id, url) {
     $("#wsOpenDirect", stage).onclick = () => openDirectPopout(url);
     return;
   }
-  const html = await res.text();
+  const data = await res.json();
   if (wsOpenForId !== id) return;
+  if (data.mode === "direct") {
+    stage.innerHTML = `<iframe class="ws-frame" id="wsFrame" src="${esc(url)}" sandbox="allow-forms allow-scripts allow-same-origin allow-popups"></iframe>`;
+    return;
+  }
   stage.innerHTML = `<iframe class="ws-frame" id="wsFrame" sandbox="allow-forms allow-scripts allow-same-origin allow-popups"></iframe>`;
-  $("#wsFrame").srcdoc = html;
+  const frame = $("#wsFrame");
+  frame.srcdoc = data.html;
+  // Give the client app a moment to hydrate (or fail to) before judging it —
+  // the iframe's "load" event fires on the raw HTML, not after its JS runs.
+  frame.addEventListener("load", () => setTimeout(() => {
+    if (wsOpenForId !== id || $("#wsFrame") !== frame) return;
+    let text = "";
+    try { text = frame.contentDocument.body.innerText; } catch (e) { /* not readable; leave it be */ }
+    if (wsLooksMisrendered(text)) {
+      stage.innerHTML = wsMisrenderedHtml(url);
+      $("#wsOpenDirect", stage).onclick = () => openDirectPopout(url);
+    }
+  }, 900));
 }
 function teardownWorkspace() {
   qaWorkspace.stopPoll();
